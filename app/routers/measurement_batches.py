@@ -178,15 +178,19 @@ async def create_measurement_batch(
 
                 # 携带成功结果写入批次行；批次键唯一约束串行化并发提交（至多一批）
                 try:
-                    batch_row = await conn.fetchrow(
-                        "INSERT INTO measurement_batches "
-                        "(id, batch_key, request_hash, status, measurement_ids) "
-                        "VALUES ($1, $2, $3, 'succeeded', $4) RETURNING *",
-                        batch_id,
-                        payload.batch_key,
-                        req_hash,
-                        measurement_ids,
-                    )
+                    # 保存点：并发撞键时唯一冲突仅回滚到保存点（错误状态随即清除，
+                    # 外层事务仍可继续查询）；若不加保存点，事务会整体进入 aborted
+                    # 状态，随后的 SELECT 必然抛 InFailedSQLTransactionError
+                    async with conn.transaction():
+                        batch_row = await conn.fetchrow(
+                            "INSERT INTO measurement_batches "
+                            "(id, batch_key, request_hash, status, measurement_ids) "
+                            "VALUES ($1, $2, $3, 'succeeded', $4) RETURNING *",
+                            batch_id,
+                            payload.batch_key,
+                            req_hash,
+                            measurement_ids,
+                        )
                 except asyncpg.UniqueViolationError:
                     racer = await conn.fetchrow(
                         "SELECT * FROM measurement_batches WHERE batch_key = $1",
@@ -242,31 +246,34 @@ async def _persist_failure(
     - 对方仍未决：放弃持久化，保留本次计算结果（调用方随后重试会重放）。
     """
     index = exc.extra["index"] if exc.extra else 0
-    try:
-        async with conn.transaction():
-            await conn.execute(
-                "INSERT INTO measurement_batches "
-                "(batch_key, request_hash, status, error_index, error_code, error_message) "
-                "VALUES ($1, $2, 'failed', $3, $4, $5)",
-                batch_key,
-                req_hash,
-                index,
-                exc.code,
-                exc.message,
+    async with conn.transaction():
+        try:
+            # 保存点：与并发已提交的同键行撞唯一约束时仅回滚到保存点，
+            # 随后同事务内的 SELECT 才不会撞上 aborted transaction
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO measurement_batches "
+                    "(batch_key, request_hash, status, error_index, error_code, error_message) "
+                    "VALUES ($1, $2, 'failed', $3, $4, $5)",
+                    batch_key,
+                    req_hash,
+                    index,
+                    exc.code,
+                    exc.message,
+                )
+        except asyncpg.UniqueViolationError:
+            existing = await conn.fetchrow(
+                "SELECT * FROM measurement_batches WHERE batch_key = $1", batch_key
             )
-    except asyncpg.UniqueViolationError:
-        existing = await conn.fetchrow(
-            "SELECT * FROM measurement_batches WHERE batch_key = $1", batch_key
-        )
-        if existing is None:
-            return
-        if existing["request_hash"] != req_hash:
-            raise ApiError(
-                409,
-                "BATCH_KEY_CONFLICT",
-                f"batch_key '{batch_key}' was already used with "
-                "different ordered records",
-            )
-        replayed = _replay(existing)
-        if isinstance(replayed, ApiError):
-            raise replayed
+            if existing is None:
+                return
+            if existing["request_hash"] != req_hash:
+                raise ApiError(
+                    409,
+                    "BATCH_KEY_CONFLICT",
+                    f"batch_key '{batch_key}' was already used with "
+                    "different ordered records",
+                )
+            replayed = _replay(existing)
+            if isinstance(replayed, ApiError):
+                raise replayed

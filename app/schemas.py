@@ -136,3 +136,60 @@ class MeasurementHistoryOut(BaseModel):
     original: MeasurementVersionOut = Field(description="原始版本（version=1）")
     corrections: list[MeasurementVersionOut] = Field(description="按版本号升序排列的更正链")
     current: MeasurementVersionOut = Field(description="当前生效版本（无更正时即原始版本）")
+
+
+# ---------------------------------------------------------------------------
+# 合规审计快照（生成后不可变）
+# ---------------------------------------------------------------------------
+
+class AuditSnapshotCreate(BaseModel):
+    device_id: str = Field(min_length=1, max_length=128, description="设备编号")
+    window_from: AwareDatetime = Field(description="审计窗起点（含，须带时区）")
+    window_to: AwareDatetime = Field(description="审计窗终点（不含，须带时区）")
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "AuditSnapshotCreate":
+        if not self.window_from < self.window_to:
+            raise ValueError("window_from must be earlier than window_to")
+        return self
+
+
+class SnapshotValidity(BaseModel):
+    is_valid: bool = Field(description="生成快照时冻结的有效性；此后证书撤销不影响快照")
+    reason: str
+
+
+class AuditSnapshotOut(BaseModel):
+    snapshot_id: str = Field(description="快照标识（随机 token），凭此分页读取明细")
+    device_id: str
+    window_from: datetime
+    window_to: datetime
+    total_count: int = Field(description="窗内记录总数（有效 + 无效；空窗为 0）")
+    valid_count: int
+    invalid_count: int
+    created_at: datetime = Field(description="快照生成时刻")
+
+
+class AuditSnapshotItemOut(BaseModel):
+    measurement_id: int = Field(description="测量编号（分页稳定排序键）")
+    version: int = Field(description="生成快照时该测量的最新版本号：原始登记为 1，每次更正 +1")
+    measured_at: datetime = Field(description="该最新版本的测量时刻")
+    certificate_no: str = Field(description="该最新版本登记/更正所用证书编号")
+    validity: SnapshotValidity = Field(
+        description="生成快照时冻结的有效性及原因（取自当时的证书撤销状态）"
+    )
+
+
+class AuditSnapshotPage(BaseModel):
+    snapshot_id: str
+    device_id: str
+    window_from: datetime
+    window_to: datetime
+    total_count: int
+    valid_count: int
+    invalid_count: int
+    limit: int
+    offset: int
+    items: list[AuditSnapshotItemOut] = Field(
+        description="按 measurement_id 升序稳定分页的明细页"
+    )

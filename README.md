@@ -9,6 +9,7 @@
 - 撤销证书**不删除**历史测量；查询时**实时**返回每条记录的当前有效性及原因
 - 证书登记支持**幂等键**：相同键 + 相同内容重试返回首次结果；相同键 + 不同内容返回 409
 - **测量批次写入**：一次提交批次键与有序记录，逐条沿用单条写入校验、**整批原子**（任一不合格返回其序号与原因且整批不落库）；批次键支持**幂等重放**——相同键 + 相同有序内容（时刻按 UTC 比较）即使证书后来撤销也返回首次结果，同键不同内容返回 409，并发同键至多生成一批
+- **合规审计快照**：按设备编号与带时区的左闭右开时间窗生成不可变快照，返回快照标识与有效/无效总数；版本链与证书撤销状态取自**同一一致视图**（并发更正/撤销只能整体位于快照前或后），生成后明细与计数**永久冻结**；凭标识按测量编号**稳定分页**读取固定字段明细
 
 ## 一键启动
 
@@ -92,6 +93,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/v1/measurements/{id}` | 详情（原始登记版本），含实时有效性 |
 | `POST` | `/api/v1/measurements/{id}/corrections` | 提交更正（**须携带当前版本号**），成功 201 返回新版本 |
 | `GET` | `/api/v1/measurements/{id}/history` | 完整历史：原始版本 + 按序更正链 + 当前版本 |
+| `POST` | `/api/v1/audit-snapshots` | 生成合规审计快照（设备 + 左闭右开时间窗），成功 201 |
+| `GET` | `/api/v1/audit-snapshots/{snapshot_id}` | 快照摘要：时间窗、有效/无效总数 |
+| `GET` | `/api/v1/audit-snapshots/{snapshot_id}/items?limit=&offset=` | 按测量编号升序稳定分页读取快照明细 |
 
 写入请求体：
 
@@ -217,6 +221,101 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 }
 ```
 
+### 合规审计快照
+
+实验室复核设备测量合规性时，按**设备编号**与**带时区的起止时刻**生成审计快照。时间窗为**左闭右开** `[window_from, window_to)`，起点必须早于终点。
+
+生成请求体：
+
+```json
+{
+  "device_id": "EQ-001",
+  "window_from": "2026-01-01T00:00:00+08:00",
+  "window_to":   "2027-01-01T00:00:00+08:00"
+}
+```
+
+成功 201 返回**快照标识**（随机不可枚举的 `snapshot_id`）与有效/无效总数（`valid_count + invalid_count = total_count`）：
+
+```json
+{
+  "snapshot_id": "be648a66a1594717bd492d512f1120c8",
+  "device_id": "EQ-001",
+  "window_from": "2025-12-31T16:00:00Z",
+  "window_to":   "2026-12-31T16:00:00Z",
+  "total_count": 3,
+  "valid_count": 2,
+  "invalid_count": 1,
+  "created_at": "2026-10-06T12:00:00Z"
+}
+```
+
+行为语义：
+
+- **纳入范围**：单条写入与批次写入的测量**均纳入**；但每条测量只取其**最新版本**（无更正时为原始 version 1，有更正时为版本号最大的一行），仅当**该最新版本的测量时刻**落在窗内才计入。旧版本即使时刻在窗内也不重复计数；最新版本时刻已被更正到窗外的测量不再出现。
+- **同一一致视图**：生成在单事务内以 `REPEATABLE READ` 隔离级别执行——"最新版本"的计算（更正链）与**证书撤销状态**取自同一数据库快照，并发的更正或撤销事务**只能整体位于快照之前或之后**，绝不会出现"计数按更正后、原因按撤销前"之类的撕裂视图。
+- **永久冻结**：明细与计数在生成时**物化**到只追加的快照表；此后对测量的更正、证书撤销或任何新写入**都不会改变**已生成快照的明细与总数（快照表挂不可变触发器，数据库层拒绝 UPDATE/DELETE）。
+- **空窗计数为零**：窗口内无任何最新版本时刻命中（含设备从未出现）时正常返回 201，三个计数均为 0，分页为空。
+- **分页稳定**：凭 `snapshot_id` 读取明细，固定按 `measurement_id` **升序**稳定排序，`limit`（1–1000，默认 100）+ `offset`（≥ 0）翻页；页与页之间发生的任何业务变更都不影响已冻结的顺序和内容。
+
+明细字段**固定**为测量编号、版本、时刻、证书编号、有效性及原因：
+
+```json
+{
+  "snapshot_id": "be648a66a1594717bd492d512f1120c8",
+  "device_id": "EQ-001",
+  "window_from": "2025-12-31T16:00:00Z",
+  "window_to":   "2026-12-31T16:00:00Z",
+  "total_count": 3,
+  "valid_count": 2,
+  "invalid_count": 1,
+  "limit": 100,
+  "offset": 0,
+  "items": [
+    {
+      "measurement_id": 2,
+      "version": 1,
+      "measured_at": "2026-08-31T23:00:00Z",
+      "certificate_no": "CERT-2026-0001",
+      "validity": {"is_valid": true, "reason": "certificate is active and covers the measurement time"}
+    },
+    {
+      "measurement_id": 7,
+      "version": 3,
+      "measured_at": "2026-05-10T02:00:00Z",
+      "certificate_no": "CERT-2026-0001",
+      "validity": {"is_valid": false,
+                   "reason": "certificate revoked at 2026-10-05T13:00:00+00:00: drift found in audit"}
+    }
+  ]
+}
+```
+
+`validity` 为**生成时刻**冻结的证书撤销状态：撤销发生在快照之后时，旧快照中的记录保持 `is_valid: true`；撤销发生在快照之前时，记录冻结为 `is_valid: false` 且原因含撤销时刻与理由。实时查询接口（`GET /measurements...`）与追加式更正接口不受影响，仍按当前状态实时计算。
+
+典型错误：
+
+| 状态码 | code | 场景 |
+|---|---|---|
+| 422 | （请求校验错误） | 时刻缺时区、`window_from >= window_to`；请求被拒绝且**不留下任何快照** |
+| 404 | `SNAPSHOT_NOT_FOUND` | 摘要或翻页接口使用了未知快照标识 |
+| 422 | （分页校验错误） | `limit` 不在 1–1000、`offset` 为负 |
+
+最小示例：
+
+```bash
+# 生成快照（201，返回 snapshot_id 与计数；响应头 Location 指向摘要）
+curl -X POST http://localhost:8000/api/v1/audit-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"EQ-001",
+       "window_from":"2026-01-01T00:00:00+08:00",
+       "window_to":"2027-01-01T00:00:00+08:00"}'
+
+# 凭标识按测量编号稳定翻页
+curl 'http://localhost:8000/api/v1/audit-snapshots/be648a66a1594717bd492d512f1120c8/items?limit=50&offset=0'
+curl 'http://localhost:8000/api/v1/audit-snapshots/be648a66a1594717bd492d512f1120c8/items?limit=50&offset=50'
+```
+
 ## 调用示例
 
 完整端到端示例（登记 → 幂等重试 → 冲突 → 测量 → 撤销 → 有效性查询 → 更正 → 版本冲突/并发 → 历史查询）：
@@ -229,6 +328,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 ./examples/batch_demo.sh
+```
+
+合规审计快照端到端示例（单条/批次写入 → 更正移出窗口 → 非法时间窗拒绝 → 生成与稳定翻页 → 空窗 → 撤销后重拍 → 旧快照冻结不变 → 未知标识 404）：
+
+```bash
+./examples/snapshot_demo.sh
 ```
 
 最小示例：
@@ -298,6 +403,9 @@ curl -X POST http://localhost:8000/api/v1/measurement-batches \
 - **追加式更正链**：更正写入 `measurement_corrections` 表，原始登记为 version 1、每次更正 +1；`(measurement_id, version)` 唯一约束 + 测量记录行锁串行化并发更正，同一版本的并发更正最多成功一次，其余收到 409 `VERSION_CONFLICT`。
 - **更正校验一致性**：更正与撤销互斥——更正事务对目标证书行加 `FOR UPDATE` 锁后再校验撤销状态与有效期覆盖，并发撤销要么先完成（更正看到已撤销并拒绝）、要么等待更正提交，不会产生基于已撤销证书的无效更正。
 - **撤销即生效**：测量查询实时 JOIN 证书状态，撤销立即反映到全部历史记录（含各更正版本）的有效性上，历史数据本身保留不动。
+- **审计快照一致视图**：快照生成在单事务内以 `REPEATABLE READ` 运行，"每个测量的最新版本"（`LEFT JOIN LATERAL ... ORDER BY version DESC LIMIT 1`，无更正取原始登记）与证书撤销状态共享同一事务快照；并发更正/撤销要么已提交（整体计入）、要么未提交（完全不可见），不存在交错的撕裂视图。
+- **审计快照物化冻结**：命中记录的版本、时刻、证书编号与按当时撤销状态计算的有效性/原因，连同有效/无效总数在生成时写入只追加的 `audit_snapshots` / `audit_snapshot_items` 两表（挂不可变触发器，数据库层拒绝改删）；此后更正、撤销、新写入均不触碰已生成快照。对外只暴露随机 `token`（32 位十六进制），顺序主键不外泄，无法被遍历枚举。
+- **快照分页稳定**：明细物化后按 `measurement_id` 升序排序、`(snapshot_id, measurement_id)` 唯一，`limit/offset` 翻页的顺序与内容不受任何后续业务变更影响。
 
 ## 目录结构
 
@@ -311,10 +419,12 @@ curl -X POST http://localhost:8000/api/v1/measurement-batches \
 │   └── routers/
 │       ├── certificates.py
 │       ├── measurements.py
-│       └── measurement_batches.py
+│       ├── measurement_batches.py
+│       └── audit_snapshots.py # 合规审计快照生成 / 摘要 / 稳定分页
 ├── db/init.sql            # 建表、约束、不可变触发器（容器首次启动自动执行）
 ├── examples/demo.sh       # 端到端调用示例
 ├── examples/batch_demo.sh # 测量批次端到端调用示例
+├── examples/snapshot_demo.sh # 审计快照端到端调用示例
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

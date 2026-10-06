@@ -68,6 +68,71 @@ CREATE TABLE IF NOT EXISTS measurement_batches (
 );
 
 -- ---------------------------------------------------------------------------
+-- 合规审计快照（immutable audit snapshot）
+--   * 复核时按设备编号 + 左闭右开时间窗 [window_from, window_to) 生成；
+--     明细取"最新版本测量时刻"落在窗内的测量（单条写入与批次写入均纳入）
+--   * 版本链与证书撤销状态在生成事务的 REPEATABLE READ 同一快照下读取，
+--     并发的更正/撤销只能整体位于快照前或后，计数与明细自洽
+--   * 明细在生成时物化（validity/reason 按当时证书撤销状态冻结），
+--     此后任何更正、撤销或新写入都不改变已生成的明细与计数
+--   * 快照与明细均只追加，挂与其余表一致的不可变触发器
+--   * token 为对外暴露的随机快照标识；顺序主键不对外暴露，避免被遍历枚举
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_snapshots (
+    id           BIGSERIAL    PRIMARY KEY,
+    token        TEXT         NOT NULL,
+    device_id    TEXT         NOT NULL,
+    window_from  TIMESTAMPTZ  NOT NULL,
+    window_to    TIMESTAMPTZ  NOT NULL,
+    total_count  INT          NOT NULL,
+    valid_count  INT          NOT NULL,
+    invalid_count INT         NOT NULL,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+
+    CONSTRAINT audit_snapshots_token_uq UNIQUE (token),
+    CONSTRAINT audit_snapshots_window_chk CHECK (window_from < window_to),
+    CONSTRAINT audit_snapshots_counts_chk CHECK (
+        total_count >= 0 AND valid_count >= 0 AND invalid_count >= 0
+        AND valid_count + invalid_count = total_count
+    )
+);
+
+CREATE INDEX IF NOT EXISTS audit_snapshots_device_idx ON audit_snapshots (device_id);
+
+CREATE TABLE IF NOT EXISTS audit_snapshot_items (
+    id             BIGSERIAL    PRIMARY KEY,
+    snapshot_id    BIGINT       NOT NULL REFERENCES audit_snapshots (id),
+    measurement_id BIGINT       NOT NULL,
+    version        INT          NOT NULL,
+    measured_at    TIMESTAMPTZ  NOT NULL,
+    certificate_no TEXT         NOT NULL,
+    is_valid       BOOLEAN      NOT NULL,
+    reason         TEXT         NOT NULL,
+
+    CONSTRAINT audit_snapshot_items_snapshot_uq UNIQUE (snapshot_id, measurement_id)
+);
+
+-- 生成时按 (设备, 最新版本测量时刻) 过滤；明细按 measurement_id 稳定排序分页
+CREATE INDEX IF NOT EXISTS audit_snapshot_items_snapshot_order_idx
+    ON audit_snapshot_items (snapshot_id, measurement_id);
+
+CREATE OR REPLACE FUNCTION reject_snapshot_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit snapshots are immutable: UPDATE/DELETE not allowed';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_snapshots_immutable_trg ON audit_snapshots;
+CREATE TRIGGER audit_snapshots_immutable_trg
+    BEFORE UPDATE OR DELETE ON audit_snapshots
+    FOR EACH ROW EXECUTE FUNCTION reject_snapshot_mutation();
+
+DROP TRIGGER IF EXISTS audit_snapshot_items_immutable_trg ON audit_snapshot_items;
+CREATE TRIGGER audit_snapshot_items_immutable_trg
+    BEFORE UPDATE OR DELETE ON audit_snapshot_items
+    FOR EACH ROW EXECUTE FUNCTION reject_snapshot_mutation();
+
+-- ---------------------------------------------------------------------------
 -- 测量记录表：一经写入不可修改、不可删除（触发器强制）
 --   * batch_id 非空时标识该记录由哪一批次写入（单条写入为 NULL）
 -- ---------------------------------------------------------------------------
@@ -83,6 +148,9 @@ CREATE TABLE IF NOT EXISTS measurements (
 CREATE INDEX IF NOT EXISTS measurements_device_idx ON measurements (device_id);
 CREATE INDEX IF NOT EXISTS measurements_cert_idx   ON measurements (certificate_id);
 CREATE INDEX IF NOT EXISTS measurements_batch_idx  ON measurements (batch_id);
+-- 审计快照按设备 + 最新版本测量时刻过滤时使用
+CREATE INDEX IF NOT EXISTS measurements_device_measured_idx
+    ON measurements (device_id, measured_at);
 
 -- 兼容旧库：measurements 已存在时幂等补列（外键同样设为延迟约束）
 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS batch_id BIGINT;
@@ -132,6 +200,9 @@ CREATE TABLE IF NOT EXISTS measurement_corrections (
 
 CREATE INDEX IF NOT EXISTS measurement_corrections_measurement_idx
     ON measurement_corrections (measurement_id);
+-- 审计快照取每个测量最新版本（ORDER BY version DESC LIMIT 1）时使用
+CREATE INDEX IF NOT EXISTS measurement_corrections_latest_version_idx
+    ON measurement_corrections (measurement_id, version DESC);
 
 CREATE OR REPLACE FUNCTION reject_correction_mutation() RETURNS trigger AS $$
 BEGIN
