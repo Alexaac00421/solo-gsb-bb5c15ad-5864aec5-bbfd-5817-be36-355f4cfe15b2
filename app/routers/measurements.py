@@ -11,8 +11,8 @@ from ..schemas import (
     MeasurementHistoryOut,
     MeasurementOut,
     MeasurementVersionOut,
-    Validity,
 )
+from ..validity import validity_for_certificate
 
 router = APIRouter()
 
@@ -25,16 +25,9 @@ JOIN certificates c ON c.id = m.certificate_id
 """
 
 
-def _validity(revoked_at, revoke_reason) -> Validity:
-    if revoked_at is not None:
-        reason = f"certificate revoked at {revoked_at.isoformat()}"
-        if revoke_reason:
-            reason += f": {revoke_reason}"
-        return Validity(is_valid=False, reason=reason)
-    return Validity(
-        is_valid=True,
-        reason="certificate is active and covers the measurement time",
-    )
+def _validity(revoked_at, revoke_reason):
+    # 统一入口：实时查询与审计快照冻结使用同一口径（见 app/validity.py）
+    return validity_for_certificate(revoked_at, revoke_reason)
 
 
 def _to_out(row) -> MeasurementOut:

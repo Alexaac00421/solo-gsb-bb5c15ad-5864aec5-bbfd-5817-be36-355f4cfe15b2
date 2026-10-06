@@ -9,6 +9,7 @@
 - 撤销证书**不删除**历史测量；查询时**实时**返回每条记录的当前有效性及原因
 - 证书登记支持**幂等键**：相同键 + 相同内容重试返回首次结果；相同键 + 不同内容返回 409
 - **测量批次写入**：一次提交批次键与有序记录，逐条沿用单条写入校验、**整批原子**（任一不合格返回其序号与原因且整批不落库）；批次键支持**幂等重放**——相同键 + 相同有序内容（时刻按 UTC 比较）即使证书后来撤销也返回首次结果，同键不同内容返回 409，并发同键至多生成一批
+- **审计快照**：按设备编号 + 带时区时间窗（左闭右开、起点早于终点）生成不可变的合规复核快照；只收录**最新版本测量时刻**落在窗内的记录（单条与批次写入都纳入），返回快照标识与有效/无效总数，凭标识按**测量编号稳定游标分页**读取冻结明细；版本与证书撤销状态取自同一一致视图，此后更正/撤销/新写入均不改变已生成快照；空窗计数为零，非法时间窗拒绝且不留快照
 
 ## 一键启动
 
@@ -92,6 +93,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/v1/measurements/{id}` | 详情（原始登记版本），含实时有效性 |
 | `POST` | `/api/v1/measurements/{id}/corrections` | 提交更正（**须携带当前版本号**），成功 201 返回新版本 |
 | `GET` | `/api/v1/measurements/{id}/history` | 完整历史：原始版本 + 按序更正链 + 当前版本 |
+| `POST` | `/api/v1/audit-snapshots` | 按设备 + 时间窗生成审计快照，成功 201 返回快照标识与有效/无效总数 |
+| `GET` | `/api/v1/audit-snapshots/{id}` | 快照头（标识、时间窗、有效/无效总数）；未知标识 404 |
+| `GET` | `/api/v1/audit-snapshots/{id}/items?after_measurement_id=&limit=` | 按测量编号稳定游标分页读取冻结明细 |
 
 写入请求体：
 
@@ -217,6 +221,86 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 }
 ```
 
+### 审计快照
+
+实验室复核设备测量合规性时，按**设备编号**与**带时区的起止时刻**生成审计快照。时间窗为**左闭右开** `[window_start, window_end)`，且起点必须早于终点。
+
+生成请求体：
+
+```json
+{
+  "device_id": "EQ-001",
+  "window_start": "2026-01-01T00:00:00+08:00",
+  "window_end":   "2027-01-01T00:00:00+08:00"
+}
+```
+
+行为语义：
+
+- **只选最新版本**：每条测量只取其**最新版本**（有更正取最近一次更正，无更正取原始登记），仅当最新版本的 `measured_at` 落在窗内才收录；测量被更正移出窗口后不再命中，旧版本只在历史接口可查。**单条写入与批次写入的记录一视同仁**。
+- **返回计数**：响应给出 `snapshot_id`（快照标识）与 `valid_count` / `invalid_count` / `total_count`；有效性按快照生成时该版本所引证书的撤销状态判定（撤销即无效，原因含撤销时刻与撤销原因）。**空窗正常生成，计数全部为 0**。
+- **一致视图**：生成在单个 `REPEATABLE READ` 事务内完成，"测量最新版本"与"证书撤销状态"取自同一数据库快照；并发的更正或撤销只能**整体位于快照之前或之后**，不会出现版本与撤销状态相互撕裂的结果。
+- **永久冻结**：计数与明细在同一事务原子复制到独立的快照表（不保留对实时表的引用，且挂不可变触发器）；**快照生成之后的更正、撤销或新写入都不会改变已生成快照的明细与总数**。既有实时查询与追加式更正不受影响、照常工作。
+- **非法请求拒绝且不留快照**：时刻缺时区、起点不早于终点（含起止相等）均返回 422，不产生任何快照行；未知 `snapshot_id` 返回 404 `SNAPSHOT_NOT_FOUND`。
+
+生成成功响应（201）：
+
+```json
+{
+  "snapshot_id": 7,
+  "device_id": "EQ-001",
+  "window_start": "2025-12-31T16:00:00Z",
+  "window_end":   "2026-12-31T16:00:00Z",
+  "valid_count": 2,
+  "invalid_count": 1,
+  "total_count": 3,
+  "created_at": "2026-10-06T14:26:49.193255+00:00"
+}
+```
+
+凭标识按**测量编号稳定游标分页**读取明细：`GET /api/v1/audit-snapshots/{snapshot_id}/items?limit=&after_measurement_id=`。
+
+- 明细**固定字段**为 `measurement_id`（测量编号）、`version`（版本）、`measured_at`（时刻）、`certificate_no`（证书编号）、`validity`（`is_valid` 有效性 + `reason` 原因）。
+- 明细始终按 `measurement_id` **升序**；首页不传游标，后续各页把上一页响应中的 `next_after_measurement_id`（即本页最后一条的测量编号）原样回传；该值为 `null` 表示已到末页。
+- 游标为左闭右开（`measurement_id > after_measurement_id`），即使重翻或并发有新写入，已生成快照的页内容也稳定不变（读取的本就是冻结副本）。`limit` 取 1–1000，默认 100。
+
+分页响应：
+
+```json
+{
+  "snapshot_id": 7,
+  "device_id": "EQ-001",
+  "window_start": "2025-12-31T16:00:00Z",
+  "window_end":   "2026-12-31T16:00:00Z",
+  "limit": 100,
+  "next_after_measurement_id": null,
+  "items": [
+    {
+      "measurement_id": 1,
+      "version": 2,
+      "measured_at": "2026-03-10T01:00:00+00:00",
+      "certificate_no": "CERT-2026-0001",
+      "validity": {"is_valid": true, "reason": "certificate is active and covers the measurement time"}
+    },
+    {
+      "measurement_id": 4,
+      "version": 1,
+      "measured_at": "2026-05-01T03:00:00+00:00",
+      "certificate_no": "CERT-2026-0001",
+      "validity": {"is_valid": false, "reason": "certificate revoked at 2026-09-01T00:00:00+00:00: audit found drift"}
+    }
+  ]
+}
+```
+
+典型错误：
+
+| 状态码 | code | 场景 |
+|---|---|---|
+| 422 | （请求校验错误） | `window_start` / `window_end` 缺时区，或起点不早于终点（拒绝且不留快照） |
+| 404 | `SNAPSHOT_NOT_FOUND` | 快照头或明细分页使用了未知快照标识 |
+| 422 | （查询参数错误） | `limit` 超出 1–1000、`after_measurement_id` 小于 1 |
+
 ## 调用示例
 
 完整端到端示例（登记 → 幂等重试 → 冲突 → 测量 → 撤销 → 有效性查询 → 更正 → 版本冲突/并发 → 历史查询）：
@@ -229,6 +313,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 ./examples/batch_demo.sh
+```
+
+审计快照端到端示例（单条 + 批次测量 → 生成快照 → 游标翻页 → 非法窗拒绝/未知标识 404 → 撤销后重拍对比 → 旧快照冻结不变）：
+
+```bash
+./examples/audit_snapshot_demo.sh
 ```
 
 最小示例：
@@ -284,6 +374,26 @@ curl -X POST http://localhost:8000/api/v1/measurement-batches \
         {"device_id":"EQ-001","measured_at":"2026-06-16T09:00:00+08:00","certificate_no":"CERT-2026-0001"}]}'
 ```
 
+审计快照最小示例：
+
+```bash
+# 生成快照：设备 + 带时区的左闭右开窗 → 201，返回快照标识与有效/无效总数
+curl -X POST http://localhost:8000/api/v1/audit-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"EQ-001",
+       "window_start":"2026-01-01T00:00:00+08:00",
+       "window_end":"2027-01-01T00:00:00+08:00"}'
+# -> 201 {"snapshot_id":7,"valid_count":2,"invalid_count":1,"total_count":3,...}
+
+# 首页明细（按测量编号升序）
+curl 'http://localhost:8000/api/v1/audit-snapshots/7/items?limit=100'
+
+# 翻页：把上一页 next_after_measurement_id 作为游标回传（为 null 即末页）
+curl 'http://localhost:8000/api/v1/audit-snapshots/7/items?limit=100&after_measurement_id=12'
+
+# 非法时间窗 → 422 且不留快照；未知标识 → 404 SNAPSHOT_NOT_FOUND
+```
+
 ## 设计要点
 
 - **区间语义**：有效期为 `[valid_from, valid_to)` 左闭右开，用 PostgreSQL `tstzrange(..., '[)')` 表达；端点相接的两段区间不算重叠。
@@ -298,6 +408,9 @@ curl -X POST http://localhost:8000/api/v1/measurement-batches \
 - **追加式更正链**：更正写入 `measurement_corrections` 表，原始登记为 version 1、每次更正 +1；`(measurement_id, version)` 唯一约束 + 测量记录行锁串行化并发更正，同一版本的并发更正最多成功一次，其余收到 409 `VERSION_CONFLICT`。
 - **更正校验一致性**：更正与撤销互斥——更正事务对目标证书行加 `FOR UPDATE` 锁后再校验撤销状态与有效期覆盖，并发撤销要么先完成（更正看到已撤销并拒绝）、要么等待更正提交，不会产生基于已撤销证书的无效更正。
 - **撤销即生效**：测量查询实时 JOIN 证书状态，撤销立即反映到全部历史记录（含各更正版本）的有效性上，历史数据本身保留不动。
+- **审计快照一致视图**：快照生成在单个 `REPEATABLE READ` 事务内完成——最新版本（原始登记或最近一次更正）与证书撤销状态在同一数据库快照中读取，并发更正/撤销要么已提交被整体看到、要么整体落在快照之后，不存在撕裂读取；事务不对业务行加锁，与正常写入/更正/撤销互不阻塞。
+- **审计快照冻结**：命中记录的测量编号、版本、时刻、证书编号、有效性及原因在生成事务内复制进 `audit_snapshot_items`（有效性原因文案与实时查询同一来源），计数写入 `audit_snapshots`，两表均挂不可变触发器且不引用实时业务表，因此此后的更正、撤销、新写入均无法改变既有明细与总数；分页只读冻结副本，按 `(snapshot_id, measurement_id)` 主键做游标范围扫描，结果稳定。
+- **快照收录口径**：以测量为单位只取其最新版本（`measurements` 中无更正的原始行 UNION 每条测量 `measurement_corrections` 中版本号最大的一行），再以最新版本 `measured_at` 做左闭右开窗过滤；单条与批次写入共用 `measurements` 表，天然一视同仁。
 
 ## 目录结构
 
@@ -308,13 +421,17 @@ curl -X POST http://localhost:8000/api/v1/measurement-batches \
 │   ├── db.py              # asyncpg 连接池
 │   ├── errors.py          # 统一错误格式
 │   ├── schemas.py         # 请求/响应模型（AwareDatetime 强制时区）
+│   ├── validity.py        # 证书撤销状态 → 有效性/原因（实时查询与快照冻结共用口径）
 │   └── routers/
 │       ├── certificates.py
 │       ├── measurements.py
-│       └── measurement_batches.py
+│       ├── measurement_batches.py
+│       └── audit_snapshots.py   # 审计快照生成 / 头查询 / 游标分页
 ├── db/init.sql            # 建表、约束、不可变触发器（容器首次启动自动执行）
 ├── examples/demo.sh       # 端到端调用示例
 ├── examples/batch_demo.sh # 测量批次端到端调用示例
+├── examples/audit_snapshot_demo.sh # 审计快照端到端调用示例
+├── tests/test_audit_snapshots.py   # 审计快照端到端测试（HTTP，需先启动服务与数据库）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

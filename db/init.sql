@@ -155,3 +155,67 @@ DROP TRIGGER IF EXISTS measurement_batches_immutable_trg ON measurement_batches;
 CREATE TRIGGER measurement_batches_immutable_trg
     BEFORE UPDATE OR DELETE ON measurement_batches
     FOR EACH ROW EXECUTE FUNCTION reject_batch_mutation();
+
+-- ---------------------------------------------------------------------------
+-- 审计快照表：按设备编号 + 带时区时间窗（左闭右开）冻结的合规复核快照
+--   * 生成时在 REPEATABLE READ 单事务内读取"测量最新版本 + 证书撤销状态"
+--     的同一一致视图，并发更正/撤销只能整体位于快照之前或之后
+--   * 计数（valid_count / invalid_count）与明细在同一事务原子写入
+--   * 快照行只追加：生成后更正、撤销或新写入均不得改变既有快照（触发器强制）
+--   * 时间窗为空窗（无命中记录）也正常生成，两个计数均为 0
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_snapshots (
+    id            BIGSERIAL    PRIMARY KEY,
+    device_id     TEXT         NOT NULL,
+    window_start  TIMESTAMPTZ  NOT NULL,
+    window_end    TIMESTAMPTZ  NOT NULL,
+    valid_count   INT          NOT NULL,
+    invalid_count INT          NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+
+    CONSTRAINT audit_snapshots_window_chk CHECK (window_start < window_end),
+    CONSTRAINT audit_snapshots_counts_chk CHECK (valid_count >= 0 AND invalid_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS audit_snapshots_device_idx ON audit_snapshots (device_id);
+
+-- ---------------------------------------------------------------------------
+-- 审计快照明细表：快照生成时刻每条命中测量的冻结最新版本
+--   * 仅收录"最新版本 measured_at 落在 [window_start, window_end) 内"的测量；
+--     单条写入与批次写入的测量一视同仁
+--   * 证书编号、有效性及原因按快照生成时的一致视图冻结，
+--     此后证书撤销 / 测量更正 / 新写入均不改变本表（触发器强制，且无外键关联实时表）
+--   * (snapshot_id, measurement_id) 为主键：分页按测量编号稳定游标读取
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_snapshot_items (
+    snapshot_id     BIGINT       NOT NULL REFERENCES audit_snapshots (id)
+                    DEFERRABLE INITIALLY DEFERRED,
+    measurement_id  BIGINT       NOT NULL,
+    version         INT          NOT NULL,
+    measured_at     TIMESTAMPTZ  NOT NULL,
+    certificate_no  TEXT         NOT NULL,
+    is_valid        BOOLEAN      NOT NULL,
+    reason          TEXT         NOT NULL,
+
+    CONSTRAINT audit_snapshot_items_pk PRIMARY KEY (snapshot_id, measurement_id)
+);
+
+CREATE INDEX IF NOT EXISTS audit_snapshot_items_snapshot_idx
+    ON audit_snapshot_items (snapshot_id, measurement_id);
+
+-- 快照及其明细同样只追加：明细与计数一经冻结不得修改或删除
+CREATE OR REPLACE FUNCTION reject_audit_snapshot_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit snapshots and their items are immutable: UPDATE/DELETE not allowed';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_snapshots_immutable_trg ON audit_snapshots;
+CREATE TRIGGER audit_snapshots_immutable_trg
+    BEFORE UPDATE OR DELETE ON audit_snapshots
+    FOR EACH ROW EXECUTE FUNCTION reject_audit_snapshot_mutation();
+
+DROP TRIGGER IF EXISTS audit_snapshot_items_immutable_trg ON audit_snapshot_items;
+CREATE TRIGGER audit_snapshot_items_immutable_trg
+    BEFORE UPDATE OR DELETE ON audit_snapshot_items
+    FOR EACH ROW EXECUTE FUNCTION reject_audit_snapshot_mutation();
